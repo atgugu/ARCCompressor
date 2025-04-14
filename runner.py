@@ -129,7 +129,7 @@ def parallelize_runs(gpu_quotas, task_usages, n_iterations, verbose=False):
 if __name__ == '__main__':
     gpu_memory_quotas = [torch.cuda.mem_get_info(i)[0] for i in range(n_gpus)]
 
-    gpu_task_quotas = [int(gpu_memory_quota // (4 * 1024**3)) for gpu_memory_quota in gpu_memory_quotas]
+    gpu_task_quotas = [int(gpu_memory_quota // (1 * 1024**3)) for gpu_memory_quota in gpu_memory_quotas] #4
     task_usages = [1 for i in range(n_tasks)]
     memory_dict, _, _ = parallelize_runs(gpu_task_quotas, task_usages, 2, verbose=False)
     
@@ -143,7 +143,7 @@ if __name__ == '__main__':
 # %% [code] {"execution":{"iopub.status.busy":"2025-03-30T04:07:09.253285Z","iopub.execute_input":"2025-03-30T04:07:09.253488Z","iopub.status.idle":"2025-03-30T04:10:47.618982Z","shell.execute_reply.started":"2025-03-30T04:07:09.253471Z","shell.execute_reply":"2025-03-30T04:10:47.618304Z"}}
 if __name__ == '__main__':
     test_steps = 20
-    safe_gpu_memory_quotas = [memory_quota - 6 * 1024**3 for memory_quota in gpu_memory_quotas]
+    safe_gpu_memory_quotas = [memory_quota - 1 * 1024**3 for memory_quota in gpu_memory_quotas] #6
     _, _, time_taken = parallelize_runs(safe_gpu_memory_quotas, task_memory_usages, test_steps, verbose=False)
 
 # %% [markdown]

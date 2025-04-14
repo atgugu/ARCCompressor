@@ -11,10 +11,10 @@ import traceback
 import numpy as np
 import torch
 
-sys.path.append('/kaggle/input/compressarc')
+sys.path.append('/home/atgu/Desktop/ARCCompressor')
 
 # This little block of code does "import preprocessing" but avoids a name collision with another module
-module_path = "/kaggle/input/compressarc/preprocessing.py"
+module_path = "/home/atgu/Desktop/ARCCompressor/preprocessing.py"
 module_name = "preprocessing"
 spec = importlib.util.spec_from_file_location(module_name, module_path)
 preprocessing = importlib.util.module_from_spec(spec)
@@ -27,6 +27,7 @@ import multitensor_systems
 import layers
 import solution_selection
 import visualization
+from bitsandbytes.optim import AdamW8bit
 
 def solve_task(task_name, split, time_limit, n_train_iterations, gpu_id, memory_dict, solutions_dict, error_queue):
     try:
@@ -34,19 +35,20 @@ def solve_task(task_name, split, time_limit, n_train_iterations, gpu_id, memory_
         torch.cuda.set_device(gpu_id)
         torch.cuda.reset_peak_memory_stats()
 
-        with open(f'../input/arc-prize-2025/arc-agi_{split}_challenges.json', 'r') as f:
+        with open(f'/home/atgu/Desktop/ARCCompressor/2025data/arc-agi_{split}_challenges.json', 'r') as f:
             problems = json.load(f)
         task = preprocessing.Task(task_name, problems[task_name], None)
         del problems
 
         model = arc_compressor.ARCCompressor(task)
-        optimizer = torch.optim.Adam(model.weights_list, lr=0.01, betas=(0.5, 0.9))
+        optimizer = optimizer = AdamW8bit(model.weights_list, lr=0.01, betas=(0.5, 0.9), weight_decay=0.0001)
+        scaler = torch.GradScaler("cuda") 
         train_history_logger = solution_selection.Logger(task)
         train_history_logger.solution_most_frequent = tuple(((0, 0), (0, 0)) for example_num in range(task.n_test))
         train_history_logger.solution_second_most_frequent = tuple(((0, 0), (0, 0)) for example_num in range(task.n_test))
 
         for train_step in range(n_train_iterations):
-            train.take_step(task, model, optimizer, train_step, train_history_logger)
+            train.take_step(task, model, optimizer, train_step, train_history_logger, scaler)
             if time.time() > time_limit:
                 break
 
