@@ -13,6 +13,9 @@ import multitensor_systems
 import layers
 import solution_selection
 import visualization
+import random
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import torch.nn.functional as F
 
 
 """
@@ -38,7 +41,7 @@ def mask_select_logprobs(mask, length):
     return log_partition, logprobs
 
 
-def take_step(task, model, optimizer, train_step, train_history_logger, scaler):
+def take_step(task, task_name, model, optimizer, train_step, train_history_logger, scaler, scheduler):
     """
     Runs a forward pass of the model on the ARC-AGI task with mixed precision.
     """
@@ -96,13 +99,89 @@ def take_step(task, model, optimizer, train_step, train_history_logger, scaler):
                 coefficient = (0.1 ** max(0, 1 - train_step / 100)) if grid_size_uncertain else 1
                 logprob = torch.logsumexp(coefficient * logprobs, dim=(0, 1)) / coefficient
                 reconstruction_error -= logprob
+                reconstruction_weight = max(10.0, 20.0 * (1.0 - train_step / 200))
+ 
 
-        loss = total_KL + 10 * reconstruction_error
+        # … after your loop that accumulates reconstruction_error …
+        reconstruction_weight = max(10.0, 20.0 * (1.0 - train_step / 200))
+        # reconstruction_weight = 10 + train_step * 0.005
+        # ── New differentiable train‐distance term ──────────────────────────────────
+        # 1) pull out the “output” channel logits for only the train examples
+        #    logits currently has shape [n_ex, C+1, X, Y, 2]
+        pred_logits_train = logits[: task.n_train, :, :, :, 1]  # [n_train, C+1, X, Y]
+
+        # 2) compute softmax over the color dimension
+        probs_train = F.softmax(pred_logits_train, dim=1)       # [n_train, C+1, X, Y]
+
+        # 3) one‑hot encode the true train grids
+        true_train = task.problem[: task.n_train, :, :, 1]      # [n_train, X, Y]
+        gt_onehot = F.one_hot(
+            true_train.long(), num_classes=probs_train.shape[1]
+        ).permute(0, 3, 1, 2).float()                            # [n_train, C+1, X, Y]
+
+        # 4) L₁ distance
+        intial_beta = 100.0       # you can tune this weight
+        final_beta  = 0.01
+        beta = max(final_beta, intial_beta / ((train_step+1)*0.01))
+
+        if(not final_beta >= beta):
+            l1_dist = torch.abs(probs_train - gt_onehot).mean()
+            p = probs_train.reshape(probs_train.shape[0], -1)
+            g = gt_onehot.reshape(gt_onehot.shape[0], -1)
+            intersection = (p*g).sum(dim=1)
+            dice_score   = (2*intersection + 1e-6)/(p.sum(dim=1)+g.sum(dim=1)+1e-6)
+            dice_loss    = 1 - dice_score.mean()
+            
+            huber_dist = F.smooth_l1_loss(probs_train, gt_onehot, reduction='mean')
+            mse_dist   = torch.mean((probs_train - gt_onehot)**2)
+            weighted_dists = beta * (l1_dist + dice_loss + huber_dist + mse_dist)
+        else:
+            weighted_dists = 0
+
+        # ── end new term ─────────────────────────────────────────────────────────
+
+        # now build your final loss including this term:
+        initial_noise = 1e-2
+        final_noise   = 1e-4
+        noise_factor  = max(final_noise, initial_noise / ((train_step+1)*0.01))
+
+
+        loss = (
+            total_KL
+        + reconstruction_weight * reconstruction_error
+        + weighted_dists
+        + random.uniform(-noise_factor, noise_factor)
+        )
+        loss = loss / 100
 
     # Use GradScaler for mixed precision backward and optimizer step
+
     scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    norm_factor = max(2.0, 100.0 / ((train_step+1)*0.2))
+    initial_sigma = 1e-3
+    final_sigma   = 1e-5
+    sigma = max(final_sigma, initial_sigma / ((train_step+1)*0.01))
+
+    for p in model.weights_list:
+        if p.grad is not None:
+            # σ can decay over time, e.g. σ₀·(1 − t/T)
+            p.grad.add_(torch.randn_like(p.grad) * sigma)
+
+    torch.nn.utils.clip_grad_norm_(model.weights_list, max_norm=norm_factor)
     scaler.step(optimizer)
     scaler.update()
+    old_lr = optimizer.param_groups[0]['lr']
+
+    # 2) step the scheduler on your scalar loss
+    scheduler.step(loss.item())
+
+    # 3) get the new LR
+    new_lr = optimizer.param_groups[0]['lr']
+
+    # 4) log if it dropped
+    if new_lr < old_lr:
+        print(f"{task_name} : [Step {train_step:4d}] LR reduced: {old_lr:.2e} → {new_lr:.2e}")  
     optimizer.zero_grad()
 
     # Log performance metrics.
@@ -117,6 +196,8 @@ def take_step(task, model, optimizer, train_step, train_history_logger, scaler):
         reconstruction_error,
         loss
     )
+
+    return loss.item()
 
 
 if __name__ == "__main__":
@@ -135,7 +216,7 @@ if __name__ == "__main__":
     for task in tasks:
         model = arc_compressor.ARCCompressor(task)
         models.append(model)
-        optimizer = Adam8bit(model.weights_list, lr=0.01, betas=(0.5, 0.9))
+        optimizer = Adam8bit(model.weights_list, lr=0.02, betas=(0.5, 0.9))
         optimizers.append(optimizer)
         scaler = GradScaler()
         scalers.append(scaler)

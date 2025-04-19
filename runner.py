@@ -42,7 +42,23 @@ import layers
 import solution_selection
 import visualization
 import solve_task
+import os
+import signal
+import psutil
 
+def kill_python3_processes():
+    current_pid = os.getpid()
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        pid   = proc.info['pid']
+        name  = proc.info['name'] or ''
+        cmd   = proc.info['cmdline'] or []
+
+        # Check if this is a python3 process (by name or command-line)
+        if pid != current_pid and ('python3' in name or (cmd and 'python3' in cmd[0])):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (psutil.NoSuchProcess, PermissionError) as e:
+                pass
 # %% [markdown]
 # ### Getting all the task names, setting defaults and constants
 
@@ -54,9 +70,10 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 
 if __name__ == '__main__':
+    kill_python3_processes()
 
     start_time = time.time()
-    end_time = start_time + 12*3600 - 300
+    end_time = start_time + 1*3600 - 200
 
     n_cpus = multiprocessing.cpu_count()
     n_gpus = torch.cuda.device_count()
@@ -67,7 +84,7 @@ if __name__ == '__main__':
         problems = json.load(f)
     task_names = list(problems.keys())
     del problems
-    n_tasks = len(task_names)
+    n_tasks = 2#len(task_names)
 
 # %% [markdown]
 # ### Function that can spawn processes and schedule them on GPUs to take up each GPUs quota
@@ -103,7 +120,7 @@ def parallelize_runs(gpu_quotas, task_usages, n_iterations, verbose=False):
                     enough_cpus = sum(map(int, tasks_started)) - sum(map(int, tasks_finished)) < n_cpus
                     if not tasks_started[i] and enough_quota and enough_cpus:
                         gpu_quotas[gpu_id] -= task_usages[i]
-                        args = (task_names[i], split, end_time, n_iterations, gpu_id, memory_dict, solutions_dict, error_queue)
+                        args = (task_names[i], split, end_time, n_iterations, gpu_id, memory_dict, solutions_dict, error_queue, i)
                         p = multiprocessing.Process(target=solve_task.solve_task, args=args)
                         p.start()
                         processes[i] = p
@@ -127,9 +144,11 @@ def parallelize_runs(gpu_quotas, task_usages, n_iterations, verbose=False):
 
 # %% [code] {"execution":{"iopub.status.busy":"2025-03-30T04:05:23.350251Z","iopub.execute_input":"2025-03-30T04:05:23.350448Z","iopub.status.idle":"2025-03-30T04:07:09.252642Z","shell.execute_reply.started":"2025-03-30T04:05:23.350432Z","shell.execute_reply":"2025-03-30T04:07:09.251912Z"}}
 if __name__ == '__main__':
+
+    print("Measuring the amount of memory used for every task")
     gpu_memory_quotas = [torch.cuda.mem_get_info(i)[0] for i in range(n_gpus)]
 
-    gpu_task_quotas = [int(gpu_memory_quota // (1 * 1024**3)) for gpu_memory_quota in gpu_memory_quotas] #4
+    gpu_task_quotas = [int(gpu_memory_quota // (1.8 * 1024**3)) for gpu_memory_quota in gpu_memory_quotas] #4
     task_usages = [1 for i in range(n_tasks)]
     memory_dict, _, _ = parallelize_runs(gpu_task_quotas, task_usages, 2, verbose=False)
     

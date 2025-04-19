@@ -41,6 +41,8 @@ class Logger:
         """Logs training progress and tracks solutions from one forward pass."""
         if train_step == 0:
             self.KL_curves = {KL_name: [] for KL_name in KL_names}
+        if train_step < 150:
+            return
 
         for KL_amount, KL_name in zip(KL_amounts, KL_names):
             self.KL_curves[KL_name].append(float(KL_amount.detach().sum().cpu().numpy()))
