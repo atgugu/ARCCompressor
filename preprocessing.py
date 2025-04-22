@@ -14,7 +14,7 @@ class Task:
     training examples by concatenation and deduplication.
     Initializes the multitensor system for model construction.
     """
-    def __init__(self, task_name, problem, solution=None, transforms=None):
+    def __init__(self, task_name, problem, solution=None, transforms='all'):
         """
         Args:
             task_name (str): ARC task identifier.
@@ -38,14 +38,16 @@ class Task:
         original_train = problem['train']
         augmented = []
         for ex in original_train:
-            for tf in funcs:
-                new_ex = copy.deepcopy(ex)
-                new_ex['input'] = tf(new_ex['input'])
-                if 'output' in new_ex:
-                    new_ex['output'] = tf(new_ex['output'])
-                augmented.append(new_ex)
+            if 'input' in ex and 'output' in ex:
+                for tf in funcs:
+                        new_ex = copy.deepcopy(ex)
+                        new_ex['input'] = tf(new_ex['input'])
+                        new_ex['output'] = tf(new_ex['output'])
+                        augmented.append(new_ex)
         train_all = original_train + augmented
 
+        # train_all += Task.augment_color_examples(train_all)
+        
         # Deduplicate examples
         unique, seen = [], set()
         for ex in train_all:
@@ -111,7 +113,51 @@ class Task:
         """Flip a 2D grid over its anti-diagonal."""
         arr = np.array(grid)
         return np.rot90(arr, 2).T.tolist()
+    
+    @staticmethod
+    def get_random_color_transforms(colors, n_permutations=1):
+        """
+        Return a list of callable transforms that permute the provided colors randomly.
 
+        Args:
+            colors (list[int]): The palette of colors in the task (e.g., task.colors).
+            n_permutations (int): Number of random permutations to generate.
+
+        Returns:
+            List[Callable[[List[List[int]]], List[List[int]]]]: A list of functions mapping grids.
+        """
+        transforms = []
+        for _ in range(n_permutations):
+            permuted = list(colors)
+            np.random.shuffle(permuted)
+            mapping = {orig: new for orig, new in zip(colors, permuted)}
+            # each transform applies the same mapping to input and output grids
+            transforms.append(lambda grid, mapping=mapping: [[mapping[c] for c in row] for row in grid])
+        return transforms
+
+    def augment_color_examples(self, examples, n_permutations=1):
+        """
+        Generate new examples by applying random color permutations.
+
+        Args:
+            examples (list of dict): A list of examples, each with 'input' and 'output' grids.
+            n_permutations (int): Number of random color mappings to apply per example.
+
+        Returns:
+            List[dict]: Augmented examples with permuted colors.
+        """
+        augmented = []
+        # Create transform functions based on this task's color palette
+        transforms = Task.get_random_color_transforms(self.colors, n_permutations)
+        for ex in examples:
+            for tf in transforms:
+                if 'input' in ex and 'output' in ex:
+                    new_ex = {
+                        'input': tf(ex['input']),
+                        'output': tf(ex['output'])
+                    }
+                augmented.append(new_ex)
+        return augmented
     def _collect_problem_shapes(self, problem):
         shapes = []
         for split in ['train', 'test']:

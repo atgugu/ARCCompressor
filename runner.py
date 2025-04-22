@@ -73,7 +73,7 @@ if __name__ == '__main__':
     kill_python3_processes()
 
     start_time = time.time()
-    end_time = int(start_time + 1.0*3600 - 200)
+    end_time = int(start_time + 0.4*3600 - 300)
 
     n_cpus = multiprocessing.cpu_count()
     n_gpus = torch.cuda.device_count()
@@ -84,7 +84,7 @@ if __name__ == '__main__':
         problems = json.load(f)
     task_names = list(problems.keys())
     del problems
-    n_tasks = 10#len(task_names)
+    n_tasks = 2#len(task_names)
 
 # %% [markdown]
 # ### Function that can spawn processes and schedule them on GPUs to take up each GPUs quota
@@ -148,7 +148,7 @@ if __name__ == '__main__':
     print("Measuring the amount of memory used for every task")
     gpu_memory_quotas = [torch.cuda.mem_get_info(i)[0] for i in range(n_gpus)]
 
-    gpu_task_quotas = [int(gpu_memory_quota // (1.8 * 1024**3)) for gpu_memory_quota in gpu_memory_quotas] #4
+    gpu_task_quotas = [int(gpu_memory_quota // (1.9 * 1024**3)) for gpu_memory_quota in gpu_memory_quotas] #4
     task_usages = [1 for i in range(n_tasks)]
     memory_dict, _, _ = parallelize_runs(gpu_task_quotas, task_usages, 2, verbose=False, calibrate=True)
     
@@ -265,7 +265,7 @@ if __name__ == '__main__':
 
         img = pixels.reshape([(n_train+n_test)*(2*n_x+2), 2*(2*n_y+8), 3])
         os.makedirs("plots", exist_ok=True)
-        fig,ax = plt.subplots(figsize=(6,6))
+        fig,ax = plt.subplots(figsize=(6,12))
         ax.imshow(img,interpolation='none',aspect='equal')
         ax.axis('off')
         fig.savefig(f"/home/atgu/Desktop/ARCCompressor/plots/{logger.task.task_name}_problem.png", bbox_inches='tight', pad_inches=0)

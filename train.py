@@ -99,11 +99,11 @@ def take_step(task, task_name, model, optimizer, train_step, train_history_logge
                 coefficient = (0.1 ** max(0, 1 - train_step / 100)) if grid_size_uncertain else 1
                 logprob = torch.logsumexp(coefficient * logprobs, dim=(0, 1)) / coefficient
                 reconstruction_error -= logprob
-                reconstruction_weight = max(10.0, 20.0 * (1.0 - train_step / 200))
  
 
         # … after your loop that accumulates reconstruction_error …
-        reconstruction_weight = max(10.0, 20.0 * (1.0 - train_step / 200))
+        # reconstruction_weight = max(10.0, 20.0 * (1.0 - train_step / 200))
+        reconstruction_weight = 10 
         # reconstruction_weight = 10 + train_step * 0.005
         # ── New differentiable train‐distance term ──────────────────────────────────
         # 1) pull out the “output” channel logits for only the train examples
@@ -140,11 +140,9 @@ def take_step(task, task_name, model, optimizer, train_step, train_history_logge
 
         # ── end new term ─────────────────────────────────────────────────────────
 
-        # now build your final loss including this term:
         initial_noise = 1e-2
         final_noise   = 1e-4
         noise_factor  = max(final_noise, initial_noise / ((train_step+1)*0.01))
-
 
         loss = (
             total_KL
@@ -158,7 +156,7 @@ def take_step(task, task_name, model, optimizer, train_step, train_history_logge
 
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
-    norm_factor = max(2.0, 100.0 / ((train_step+1)*0.2))
+    norm_factor = 1
     initial_sigma = 1e-5
     final_sigma   = 1e-7
     sigma = max(final_sigma, initial_sigma / ((train_step+1)*0.01))

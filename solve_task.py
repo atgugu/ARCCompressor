@@ -41,34 +41,28 @@ def solve_task(task_name,
         path = f'/home/atgu/Desktop/ARCCompressor/2025data/arc-agi_{split}_challenges.json'
         with open(path, 'r') as f:
             problems = json.load(f)
-        # task = preprocessing.Task(task_name, problems[task_name], None)
-        transforms = [
-            preprocessing.Task.rotate_grid,
-            lambda g: preprocessing.Task.rotate_grid(g, 2),
-            lambda g: preprocessing.Task.rotate_grid(g, 3),
-            preprocessing.Task.flip_diagonal,
-            preprocessing.Task.flip_antidiagonal,
-            lambda g: g,
-        ]
-        task = preprocessing.Task(task_name, problems[task_name], None, transforms=transforms)
 
+        task = preprocessing.Task(task_name, problems[task_name], None, transforms='all')
 
         # --- Build model / optimizer / scaler / scheduler / logger ---
         model     = arc_compressor.ARCCompressor(task)
         model.load_invariant(f'/home/atgu/Desktop/ARCCompressor/invariants/{task_name}.pt')    
+        train_history_logger = solution_selection.Logger(task)
+        train_history_logger.solution_most_frequent = tuple(((0, 0), (0, 0)) for example_num in range(task.n_test))
+        train_history_logger.solution_second_most_frequent = tuple(((0, 0), (0, 0)) for example_num in range(task.n_test))
 
         optimizer = AdamW8bit(
             model.weights_list,
-            lr=1e-2,
-            betas=(0.5, 0.9),
-            weight_decay=1e-4
+            lr=3e-3,
+            betas=(0.7, 0.95),
+            weight_decay=1e-6
         )
         scaler    = torch.amp.GradScaler('cuda')
         scheduler = ReduceLROnPlateau(
             optimizer,
             mode='min',
-            factor=0.99,
-            patience=30,
+            factor=0.8,
+            patience=20,
             threshold=1e-3,
             min_lr=1e-4
         )
@@ -86,6 +80,8 @@ def solve_task(task_name,
         best_loss = float('inf')
 
         for step in pbar:
+            if time.time() > time_limit:
+                break
             # one training step returns the scalar loss
             loss = train.take_step(
                 task, task_name, model, optimizer,
@@ -115,48 +111,21 @@ def solve_task(task_name,
                     if torch.equal(preds[:task.n_train], true_train):
                         print("Early stop at step", step, " for task", task_name, "with loss", loss, "and best loss", best_loss, " fully reconstructed train outputs.")
                         break
+                # scheduler.step(loss)
 
-                # LR schedule and time check
-                scheduler.step(loss)
-                if time.time() > time_limit:
-                    break
-
-        # --- Inference on test split ---
-        with torch.no_grad():
-            # raw model output has shape [N, C, X, Y, 2]
-            out, x_mask, y_mask, _, _ = model.forward()
-
-            # select the “output” channel = index 1 of that last dim → now [N, C, X, Y]
-            logits_pred = out[..., 1]
-
-            # add a zero‐logit “black” class at color‐index 0 → [N, C+1, X, Y]
-            logits_pred = torch.cat(
-                [torch.zeros_like(logits_pred[:, :1, :, :]), logits_pred],
-                dim=1
-            )
-
-            # split off only the test examples
-            test_logits = logits_pred[task.n_train:]      # [n_test, C+1, X, Y]
-            test_xmask  = x_mask[task.n_train:, :, 1]     # [n_test, X]
-            test_ymask  = y_mask[task.n_train:, :, 1]     # [n_test, Y]
-
-            # now these have exactly the right shapes for Logger._postprocess_solution
-            solutions, _ = logger._postprocess_solution(
-                test_logits, test_xmask, test_ymask
-            )
-
-        # turn into the two‑attempt format
         example_list = []
-        for grid in solutions:
-            sol = [list(row) for row in grid]
-            example_list.append({
-                'attempt_1': sol,
-                'attempt_2': sol
-            })
+        for example_num in range(task.n_test):
+            attempt_1 = [list(row) for row in train_history_logger.solution_most_frequent[example_num]]
+            attempt_2 = [list(row) for row in train_history_logger.solution_second_most_frequent[example_num]]
+            example_list.append({'attempt_1': attempt_1, 'attempt_2': attempt_2})
+        del task
+        del model
+        del optimizer
+        del train_history_logger
+        torch.cuda.empty_cache()
+        gc.collect()
 
-        # … cleanup & memory report unchanged …
-        memory_dict[task_name]    = torch.cuda.max_memory_allocated()
+        memory_dict[task_name] = torch.cuda.max_memory_allocated()
         solutions_dict[task_name] = example_list
-
-    except Exception:
+    except Exception as e:
         error_queue.put(traceback.format_exc())

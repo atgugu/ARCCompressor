@@ -1,29 +1,24 @@
 import numpy as np
 import torch
-
 import initializers
 import layers
 import torch.nn as nn
-
 import multitensor_systems
 
 np.random.seed(0)
 torch.manual_seed(0)
 torch.set_default_dtype(torch.float32)
 torch.set_default_device('cuda')
-import torch.nn.functional as F
 
 def add_noise_multitensor(x, sigma):
-    # wrap a function that takes a real tensor and adds noise
     return multitensor_systems.multify(
         lambda dims, t: t + sigma * torch.randn_like(t)
     )(x)
+
 class ARCCompressor:
     """
-    The main model class for the VAE Decoder in our solution to ARC.
+    VAE Decoder with on-the-fly color permutation augmentation.
     """
-
-    # Define the channel dimensions that all the layers use
     n_layers = 2
     share_up_dim = 64
     share_down_dim = 32
@@ -31,26 +26,18 @@ class ARCCompressor:
     softmax_dim = 8
     cummax_dim = 16
     shift_dim = 16
-    nonlinear_dim = 512 
+    nonlinear_dim = 512
 
-
-    # This function gives the channel dimension of the residual stream depending on
-    # which dimensions are present, for every tensor in the multitensor.
     def channel_dim_fn(self, dims):
         return 16 if dims[2] == 0 else 8
 
     def __init__(self, task):
-        """
-        Create a model that is tailored to the given task, and initialize all the weights.
-        The weights are symmetrized such that swapping the x and y dimension ordering should
-        make the output's dimension ordering also swapped, for the same weights. This may not
-        be exactly correct since symmetrizing all operations is difficult.
-        Args:
-            task (preprocessing.Task): The task which the model is to be made for solving.
-        """
-        self.multitensor_system = task.multitensor_system
+        self.task = task
+        # Store original ground-truth tensor for color-aug
+        self.problem_orig = task.problem.clone()
+        self.n_colors_plus1 = task.n_colors + 1
 
-        # Initialize weights
+        self.multitensor_system = task.multitensor_system
         initializer = initializers.Initializer(self.multitensor_system, self.channel_dim_fn)
 
         self.multiposteriors = initializer.initialize_multiposterior(self.decoding_dim)
@@ -58,167 +45,70 @@ class ARCCompressor:
         initializer.symmetrize_xy(self.decode_weights)
         self.target_capacities = initializer.initialize_multizeros([self.decoding_dim])
 
-        self.share_up_weights = []
-        self.share_down_weights = []
-        self.softmax_weights = []
-        self.cummax_weights = []
-        self.shift_weights = []
-        self.direction_share_weights = []
-        self.nonlinear_weights = []
-        self.gaussian_noise = 0.01
-        # --- new: spatial self‑attention on the [in/out] residual ---
-        # dims = [1,1,0,1,1] → channel_dim_fn gives us the embed size
+        # Attention, GRU, SE, and other modules (unchanged)
         embed_dim = self.channel_dim_fn([1,1,0,1,1])
-        self.spatial_attn = nn.MultiheadAttention(
-            embed_dim=embed_dim,
-            num_heads=8,
-            batch_first=False
-        )   
-
-        # --- new: one *global* MHSA over the whole [in/out] core ---
-        # we'll attend over every (color, x, y) position as one long sequence,
-        # embedding size = channel_dim_fn([1,1,0,1,1])
-        global_embed = self.channel_dim_fn([1,1,0,1,1])
-        self.global_attn = nn.MultiheadAttention(
-            embed_dim=global_embed,
-            num_heads=8,
-            batch_first=True
-        )
-
-
-        E = self.channel_dim_fn([1,1,0,1,1])           # latent dim of one pixel
-        # we choose 4 heads here, but you can tune num_heads
+        self.spatial_attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=8, batch_first=False)
+        self.global_attn  = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=8, batch_first=True)
+        E = embed_dim
         self.temporal_attn = nn.MultiheadAttention(embed_dim=E, num_heads=8, batch_first=True)
-
-        # 1‑head Graph‑Attention over “object slots”
         self.obj_q   = nn.Linear(E, E, bias=False)
         self.obj_k   = nn.Linear(E, E, bias=False)
         self.obj_v   = nn.Linear(E, E, bias=False)
         self.obj_out = nn.Linear(E, E, bias=False)
 
-        # --- ConvGRU cell (single gate = GRU‑style, 3×3 conv) ----------------
         class _ConvGRU(nn.Module):
             def __init__(self, E):
                 super().__init__()
                 self.E = E
-                self.conv_zr = nn.Conv2d(E * 2, E * 2, 3, padding=1)  # z & r gates
-                self.conv_h  = nn.Conv2d(E * 2, E,     3, padding=1)  # candidate ĥ
-
+                self.conv_zr = nn.Conv2d(E*2, E*2, 3, padding=1)
+                self.conv_h  = nn.Conv2d(E*2, E,   3, padding=1)
             def forward(self, h, x):
-                # h,x: [B,E,H,W]
-                z, r = torch.split(self.conv_zr(torch.cat([h, x], 1)), self.E, 1)
+                z, r = torch.split(self.conv_zr(torch.cat([h,x],1)), self.E, 1)
                 z, r = torch.sigmoid(z), torch.sigmoid(r)
-                h_hat = torch.tanh(self.conv_h(torch.cat([r * h, x], 1)))
-                return (1 - z) * h + z * h_hat
-        # ---------------------------------------------------------------------
-
-        E = embed_dim  # from earlier
+                h_hat = torch.tanh(self.conv_h(torch.cat([r*h, x],1)))
+                return (1-z)*h + z*h_hat
         self.gru = _ConvGRU(E)
 
-        # linear maps for the cross‑attention (Q from h, K/V from slots)
-        self.ca_q = nn.Conv2d(E, E, 1, bias=False)     # 1×1 conv = per‑pixel linear
-        self.ca_k = nn.Linear(E, E,  bias=False)
-        self.ca_v = nn.Linear(E, E,  bias=False)
+        self.ca_q = nn.Conv2d(E, E, 1, bias=False)
+        self.ca_k = nn.Linear(E, E, bias=False)
+        self.ca_v = nn.Linear(E, E, bias=False)
 
-        C = self.channel_dim_fn([1,1,0,1,1])  # e.g. 16
+        C = embed_dim
         self.se_fc1 = nn.Linear(C, C//4)
         self.se_fc2 = nn.Linear(C//4, C)
-        for layer_num in range(self.n_layers):
+
+        # MultiTensor-system weights
+        self.share_up_weights = []
+        self.share_down_weights = []
+        self.softmax_weights = []
+        self.cummax_weights  = []
+        self.shift_weights   = []
+        self.direction_share_weights = []
+        self.nonlinear_weights       = []
+        self.gaussian_noise = 0.01
+
+        for _ in range(self.n_layers):
             self.share_up_weights.append(initializer.initialize_multiresidual(self.share_up_dim, self.share_up_dim))
             self.share_down_weights.append(initializer.initialize_multiresidual(self.share_down_dim, self.share_down_dim))
-            output_scaling_fn = lambda dims: self.softmax_dim * (2 ** (dims[1] + dims[2] + dims[3] + dims[4]) - 1)
-            self.softmax_weights.append(initializer.initialize_multiresidual(self.softmax_dim, output_scaling_fn))
+            self.softmax_weights.append(initializer.initialize_multiresidual(self.softmax_dim, lambda dims: self.softmax_dim*(2**sum(dims[1:])-1)))
             self.cummax_weights.append(initializer.initialize_multiresidual(self.cummax_dim, self.cummax_dim))
             self.shift_weights.append(initializer.initialize_multiresidual(self.shift_dim, self.shift_dim))
             self.direction_share_weights.append(initializer.initialize_multidirection_share())
             self.nonlinear_weights.append(initializer.initialize_multiresidual(self.nonlinear_dim, self.nonlinear_dim))
 
         self.head_weights = initializer.initialize_head()
-        self.mask_weights = initializer.initialize_linear(
-            [1, 0, 0, 1, 0], [self.channel_dim_fn([1, 0, 0, 1, 0]), 2]
-        )
+        self.mask_weights = initializer.initialize_linear([1,0,0,1,0], [self.channel_dim_fn([1,0,0,1,0]), 2])
 
-        # Symmetrize weights so that their behavior is equivariant to swapping x and y dimension ordering
-        for weight_list in [
-            self.share_up_weights,
-            self.share_down_weights,
-            self.softmax_weights,
-            self.cummax_weights,
-            self.shift_weights,
-            self.nonlinear_weights,
-        ]:
-            for layer_num in range(self.n_layers):
-                initializer.symmetrize_xy(weight_list[layer_num])
-
-        for layer_num in range(self.n_layers):
-            initializer.symmetrize_direction_sharing(self.direction_share_weights[layer_num])
+        # Symmetrize all multi-tensor weights
+        for lst in [self.share_up_weights, self.share_down_weights,
+                    self.softmax_weights, self.cummax_weights,
+                    self.shift_weights, self.nonlinear_weights]:
+            for w in lst:
+                initializer.symmetrize_xy(w)
+        for ds in self.direction_share_weights:
+            initializer.symmetrize_direction_sharing(ds)
 
         self.weights_list = initializer.weights_list
-    # @staticmethod
-
-    def save_all(module, filepath):
-        """
-        Save all sub‑modules and standalone tensors of ARCCompressor,
-        keyed by attribute name, to a checkpoint.
-        """
-        to_save = {}
-        for name, val in module.__dict__.items():
-            # 1) nn.Modules: save their state_dict()
-            if isinstance(val, torch.nn.Module):
-                to_save[f"module:{name}"] = val.state_dict()
-            # 2) plain Tensors: save directly
-            elif isinstance(val, torch.Tensor):
-                to_save[f"tensor:{name}"] = val.detach().cpu()
-            # 3) lists of Tensors (e.g. weights_list)
-            elif isinstance(val, list):
-                flat = []
-                for i, elem in enumerate(val):
-                    if isinstance(elem, torch.Tensor):
-                        flat.append((i, elem.detach().cpu()))
-                if flat:
-                    to_save[f"list:{name}"] = flat
-        torch.save(to_save, filepath)
-
-
-    def load_all(module, filepath, device='cuda'):
-        """
-        Load back everything saved by save_all(), only overwriting entries
-        whose shapes match the current module.
-        """
-        try:
-            ckpt = torch.load(filepath, map_location=device)
-        except Exception as e:
-            print(f"Failed to load checkpoint from {filepath}: {e}")
-            return
-
-        for key, val in ckpt.items():
-            kind, name = key.split(":", 1)
-            if kind == "module" and hasattr(module, name):
-                submod = getattr(module, name)
-                try:
-                    submod.load_state_dict(val, strict=False)
-                except Exception as e:
-                    print(f"Skipping module '{name}' (load error: {e})")
-
-            elif kind == "tensor" and hasattr(module, name):
-                orig = getattr(module, name)
-                if isinstance(orig, torch.Tensor) and orig.shape == val.shape:
-                    setattr(module, name, val.to(orig.device))
-                else:
-                    print(f"Skipping tensor '{name}': shape {val.shape} ≠ {getattr(module, name).shape}")
-
-            elif kind == "list" and hasattr(module, name):
-                orig_list = getattr(module, name)
-                for idx, tensor in val:
-                    if idx < len(orig_list) and isinstance(orig_list[idx], torch.Tensor):
-                        if orig_list[idx].shape == tensor.shape:
-                            orig_list[idx] = tensor.to(orig_list[idx].device)
-                        else:
-                            print(f"Skipping list '{name}'[{idx}]: shape {tensor.shape} ≠ {orig_list[idx].shape}")
-
-            # anything else (unknown key or missing attr) is safely ignored
-
-
     def save_invariant(module, filepath):
         """
         Save all invariant submodules of ARCCompressor to a file.
@@ -289,97 +179,56 @@ class ARCCompressor:
             module.ca_v.load_state_dict(state["ca_v"])
         except:
             print("Failed to load weights for task ", filepath)
-
     def forward(self):
-        """
-        Compute the forward pass of the VAE decoder. Start by using internally stored latents,
-        and process from there. Output an [example, color, x, y, channel] tensor for the colors,
-        and an [example, x, channel] and [example, y, channel] tensor for the masks.
-        Returns:
-            Tensor: An [example, color, x, y, channel] tensor, where for every example,
-                    input/output (picked by channel dimension), and every pixel (picked
-                    by x and y dimensions), we have a vector full of logits for that
-                    pixel being each possible color.
-            Tensor: An [example, x, channel] tensor, where for every example, input/output
-                    (picked by channel dimension), and every x, we assign a score that
-                    contributes to the likelihood that that index of the x dimension is not
-                    masked out in the prediction.
-            Tensor: An [example, y, channel] tensor, used in the same way as above.
-            list[Tensor]: A list of tensors indicating the amount of KL contributed by each component
-                    tensor in the layers.decode_latents() step.
-            list[str]: A list of tensor names that correspond to each tensor in the aforementioned output.
-        """
-        # Decoding layer
+        # On-the-fly color permutation during training
+        if True:
+             perm = torch.arange(self.n_colors_plus1, device=self.problem_orig.device)
+             perm[1:] = perm[1:][torch.randperm(self.n_colors_plus1-1)]
+ 
+             # only permute the *training* examples, leave test examples' inputs intact
+             # self.problem_orig shape: [n_examples, X, Y, 2]
+             permuted = self.problem_orig.clone()
+             permuted[:self.task.n_train] = perm[self.problem_orig[:self.task.n_train]]
+             self.task.problem = permuted
+        else:
+            # restore original
+            self.task.problem = self.problem_orig
+
+        # Standard decoding pipeline:
         x, KL_amounts, KL_names = layers.decode_latents(
             self.target_capacities, self.decode_weights, self.multiposteriors
         )
-
         for layer_num in range(self.n_layers):
-            # Multitensor communication layer
-            x = layers.share_up(x, self.share_up_weights[layer_num])
+            x = layers.share_up(x, self.share_up_weights[layer_num]); 
             x = add_noise_multitensor(x, self.gaussian_noise)
-
-            # Softmax layer
             x = layers.softmax(x, self.softmax_weights[layer_num], pre_norm=True, post_norm=False, use_bias=False)
             x = add_noise_multitensor(x, self.gaussian_noise)
-
-            # Directional layers
-            x = layers.cummax(
-                x, self.cummax_weights[layer_num], self.multitensor_system.task.masks,
-                pre_norm=False, post_norm=True, use_bias=False
-            )
+            x = layers.cummax(x, self.cummax_weights[layer_num], self.multitensor_system.task.masks, pre_norm=False, post_norm=True, use_bias=False) 
             x = add_noise_multitensor(x, self.gaussian_noise)
-
-            x = layers.shift(
-                x, self.shift_weights[layer_num], self.multitensor_system.task.masks,
-                pre_norm=False, post_norm=True, use_bias=False
-            )
+            x = layers.shift(x, self.shift_weights[layer_num], self.multitensor_system.task.masks, pre_norm=False, post_norm=True, use_bias=False)
             x = add_noise_multitensor(x, self.gaussian_noise)
-
-
-            # Directional communication layer
             x = layers.direction_share(x, self.direction_share_weights[layer_num], pre_norm=True, use_bias=False)
             x = add_noise_multitensor(x, self.gaussian_noise)
-
-            # Nonlinear layer
             x = layers.nonlinear(x, self.nonlinear_weights[layer_num], pre_norm=True, post_norm=False, use_bias=False)
             x = add_noise_multitensor(x, self.gaussian_noise)
-
-            # Multitensor communication layer
             x = layers.share_down(x, self.share_down_weights[layer_num])
             x = add_noise_multitensor(x, self.gaussian_noise)
-
-            # Normalization layer
             x = layers.normalize(x)
 
-            # — Squeeze‑and‑Excitation —
-            core = x[[1,1,0,1,1]]          # [B, C, H, W]
-            w = core.mean(dim=(2,3))       # [B, C]
-            w = torch.relu(self.se_fc1(w))
-            w = torch.sigmoid(self.se_fc2(w))  # [B, C]
-            core = core * w[:,:,None,None]      # scale each channel
-            x[[1,1,0,1,1]] = core
-            # — end SE —
-            
-            # — insert self‑attention over the [in/out] residual —
-            # extract the real tensor for dims=[1,1,0,1,1]
-            core = x[[1,1,0,1,1]]        # shape: [B, C_color, H, W, E]
-            B, Cc, H, W, E = core.shape
-
-            # flatten per‑color spatial positions into a sequence of length H*W
-            flat = core.view(B*Cc, H*W, E)    # (batch*n_colors, seq_len, embed)
-
-            # run multi‑head attention (we set batch_first=True)
-            attn_out, _ = self.spatial_attn(flat, flat, flat)
-
-            # unflatten and residual‑add
-            attn_out = attn_out.view(B, Cc, H, W, E)
-            core     = core + attn_out
-
-            # write it back into the MultiTensor at dims [1,1,0,1,1]
+            # Squeeze-and-Excitation
+            core = x[[1,1,0,1,1]]  # [B,C,H,W]
+            w = core.mean(dim=(2,3))
+            w = torch.relu(self.se_fc1(w)); w = torch.sigmoid(self.se_fc2(w))
+            core = core * w[:,:,None,None]
             x[[1,1,0,1,1]] = core
 
-        # now project with your existing linear heads
+            # Spatial self-attention
+            core5d = x[[1,1,0,1,1]]  # [B,Cc,H,W,E]
+            B,Cc,H,W,E = core5d.shape
+            flat = core5d.view(B*Cc, H*W, E)
+            attn_out,_ = self.spatial_attn(flat, flat, flat)
+            attn_out = attn_out.view(B,Cc,H,W,E)
+            x[[1,1,0,1,1]] = core5d + attn_out
 
         # — global self‑attention —
         core5d = x[[1, 1, 0, 1, 1]]          # [B, Cc, H, W, E]
@@ -430,7 +279,7 @@ class ARCCompressor:
         K, V  = self.ca_k(slots), self.ca_v(slots)
 
         # UNROLL + COLLECT
-        T = 24
+        T = 6
         h_seq = []
         for _ in range(T):
             # cross‐attention message (unchanged)
@@ -446,32 +295,19 @@ class ARCCompressor:
         # STACK into [B, T, E, H, W]
         h_seq = torch.stack(h_seq, dim=1)
 
-        # SPATIALLY POOL into [B, T, E]
-        #   (you could also use a 1×1 conv + flatten if you wanted something richer)
-        h_summary = h_seq.mean(dim=[3,4])  # mean over H,W
-
-        # TEMPORAL SELF‐ATTENTION
-        #   Input: [B, T, E], returns same shape
-        h_temporal, _ = self.temporal_attn(h_summary, h_summary, h_summary)
-
-        # FUSE the *last* attended vector back into your final hidden map
-        #   take the last time‐step’s refined embedding
-        h_refined = h + h_temporal[:, -1, :].view(B, E, 1, 1).expand(-1, -1, H, W)
-
-        # write it back into the core tensor
-        core5d = core5d + h_refined.permute(0,2,3,1).unsqueeze(1)
+        # PER‑PIXEL TEMPORAL SELF‑ATTENTION
+        flat = h_seq.permute(0, 3, 4, 1, 2).reshape(B*H*W, T, E)
+        out, _ = self.temporal_attn(flat, flat, flat)
+        out = out.reshape(B, H, W, T, E).mean(dim=3)  # pool over time
+ 
+        # FUSE back into the hidden map
+        core5d = core5d + out.unsqueeze(1)             # now [B, 1, H, W, E] broadcasts to [B, Cc, H, W, E]
         x[[1,1,0,1,1]] = core5d
         # -----------------------------------------------------------
-        # Linear Heads
-        output = (
-            layers.affine(x[[1, 1, 0, 1, 1]], self.head_weights, use_bias=False)
-            + 100 * self.head_weights[1]
-        )
-        x_mask = layers.affine(x[[1, 0, 0, 1, 0]], self.mask_weights, use_bias=True)
-        y_mask = layers.affine(x[[1, 0, 0, 0, 1]], self.mask_weights, use_bias=True)
-
-        # Postprocessing
+        # Final heads
+        output = (layers.affine(x[[1,1,0,1,1]], self.head_weights, use_bias=False)
+                  + 100*self.head_weights[1])
+        x_mask = layers.affine(x[[1,0,0,1,0]], self.mask_weights, use_bias=True)
+        y_mask = layers.affine(x[[1,0,0,0,1]], self.mask_weights, use_bias=True)
         x_mask, y_mask = layers.postprocess_mask(self.multitensor_system.task, x_mask, y_mask)
-
         return output, x_mask, y_mask, KL_amounts, KL_names
-
