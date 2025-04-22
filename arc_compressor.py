@@ -88,7 +88,7 @@ class ARCCompressor:
 
         E = self.channel_dim_fn([1,1,0,1,1])           # latent dim of one pixel
         # we choose 4 heads here, but you can tune num_heads
-        self.temporal_attn = nn.MultiheadAttention(embed_dim=E, num_heads=4, batch_first=True)
+        self.temporal_attn = nn.MultiheadAttention(embed_dim=E, num_heads=8, batch_first=True)
 
         # 1‑head Graph‑Attention over “object slots”
         self.obj_q   = nn.Linear(E, E, bias=False)
@@ -155,6 +155,70 @@ class ARCCompressor:
 
         self.weights_list = initializer.weights_list
     # @staticmethod
+
+    def save_all(module, filepath):
+        """
+        Save all sub‑modules and standalone tensors of ARCCompressor,
+        keyed by attribute name, to a checkpoint.
+        """
+        to_save = {}
+        for name, val in module.__dict__.items():
+            # 1) nn.Modules: save their state_dict()
+            if isinstance(val, torch.nn.Module):
+                to_save[f"module:{name}"] = val.state_dict()
+            # 2) plain Tensors: save directly
+            elif isinstance(val, torch.Tensor):
+                to_save[f"tensor:{name}"] = val.detach().cpu()
+            # 3) lists of Tensors (e.g. weights_list)
+            elif isinstance(val, list):
+                flat = []
+                for i, elem in enumerate(val):
+                    if isinstance(elem, torch.Tensor):
+                        flat.append((i, elem.detach().cpu()))
+                if flat:
+                    to_save[f"list:{name}"] = flat
+        torch.save(to_save, filepath)
+
+
+    def load_all(module, filepath, device='cuda'):
+        """
+        Load back everything saved by save_all(), only overwriting entries
+        whose shapes match the current module.
+        """
+        try:
+            ckpt = torch.load(filepath, map_location=device)
+        except Exception as e:
+            print(f"Failed to load checkpoint from {filepath}: {e}")
+            return
+
+        for key, val in ckpt.items():
+            kind, name = key.split(":", 1)
+            if kind == "module" and hasattr(module, name):
+                submod = getattr(module, name)
+                try:
+                    submod.load_state_dict(val, strict=False)
+                except Exception as e:
+                    print(f"Skipping module '{name}' (load error: {e})")
+
+            elif kind == "tensor" and hasattr(module, name):
+                orig = getattr(module, name)
+                if isinstance(orig, torch.Tensor) and orig.shape == val.shape:
+                    setattr(module, name, val.to(orig.device))
+                else:
+                    print(f"Skipping tensor '{name}': shape {val.shape} ≠ {getattr(module, name).shape}")
+
+            elif kind == "list" and hasattr(module, name):
+                orig_list = getattr(module, name)
+                for idx, tensor in val:
+                    if idx < len(orig_list) and isinstance(orig_list[idx], torch.Tensor):
+                        if orig_list[idx].shape == tensor.shape:
+                            orig_list[idx] = tensor.to(orig_list[idx].device)
+                        else:
+                            print(f"Skipping list '{name}'[{idx}]: shape {tensor.shape} ≠ {orig_list[idx].shape}")
+
+            # anything else (unknown key or missing attr) is safely ignored
+
+
     def save_invariant(module, filepath):
         """
         Save all invariant submodules of ARCCompressor to a file.
@@ -194,35 +258,37 @@ class ARCCompressor:
         """
         Load all invariant submodules of ARCCompressor from a file.
         """
-        state = torch.load(filepath, map_location=device)
-        # spatial + global attention
-        module.spatial_attn.load_state_dict(state["spatial_attn"])
-        module.global_attn.load_state_dict(state["global_attn"])
-        # temporal attention
-        module.temporal_attn.load_state_dict(state["temporal_attn"])
-        # squeeze-and-excitation
-        module.se_fc1.load_state_dict(state["se_fc1"])
-        module.se_fc2.load_state_dict(state["se_fc2"])
-        # heads & masks: copy into raw weight Tensors
-        hw = state["head_w"].to(device)
-        hb = state["head_b"].to(device)
-        module.head_weights[0].data.copy_(hw)
-        module.head_weights[1].data.copy_(hb)
-        mw = state["mask_w"].to(device)
-        mb = state["mask_b"].to(device)
-        module.mask_weights[0].data.copy_(mw)
-        module.mask_weights[1].data.copy_(mb)
-        # object-slot graph-attention
-        module.obj_q.load_state_dict(state["obj_q"])
-        module.obj_k.load_state_dict(state["obj_k"])
-        module.obj_v.load_state_dict(state["obj_v"])
-        module.obj_out.load_state_dict(state["obj_out"])
-        # GRU and cross-attention
-        module.gru.load_state_dict(state["gru"])
-        module.ca_q.load_state_dict(state["ca_q"])
-        module.ca_k.load_state_dict(state["ca_k"])
-        module.ca_v.load_state_dict(state["ca_v"])
-
+        try:
+            state = torch.load(filepath, map_location=device, weights_only=False)
+            # spatial + global attention
+            module.spatial_attn.load_state_dict(state["spatial_attn"])
+            module.global_attn.load_state_dict(state["global_attn"])
+            # temporal attention
+            module.temporal_attn.load_state_dict(state["temporal_attn"])
+            # squeeze-and-excitation
+            module.se_fc1.load_state_dict(state["se_fc1"])
+            module.se_fc2.load_state_dict(state["se_fc2"])
+            # heads & masks: copy into raw weight Tensors
+            hw = state["head_w"].to(device)
+            hb = state["head_b"].to(device)
+            module.head_weights[0].data.copy_(hw)
+            module.head_weights[1].data.copy_(hb)
+            mw = state["mask_w"].to(device)
+            mb = state["mask_b"].to(device)
+            module.mask_weights[0].data.copy_(mw)
+            module.mask_weights[1].data.copy_(mb)
+            # object-slot graph-attention
+            module.obj_q.load_state_dict(state["obj_q"])
+            module.obj_k.load_state_dict(state["obj_k"])
+            module.obj_v.load_state_dict(state["obj_v"])
+            module.obj_out.load_state_dict(state["obj_out"])
+            # GRU and cross-attention
+            module.gru.load_state_dict(state["gru"])
+            module.ca_q.load_state_dict(state["ca_q"])
+            module.ca_k.load_state_dict(state["ca_k"])
+            module.ca_v.load_state_dict(state["ca_v"])
+        except:
+            print("Failed to load weights for task ", filepath)
 
     def forward(self):
         """

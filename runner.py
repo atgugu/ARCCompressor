@@ -73,7 +73,7 @@ if __name__ == '__main__':
     kill_python3_processes()
 
     start_time = time.time()
-    end_time = int(start_time + 0.5*3600 - 200)
+    end_time = int(start_time + 1.0*3600 - 200)
 
     n_cpus = multiprocessing.cpu_count()
     n_gpus = torch.cuda.device_count()
@@ -84,13 +84,13 @@ if __name__ == '__main__':
         problems = json.load(f)
     task_names = list(problems.keys())
     del problems
-    n_tasks = 2#len(task_names)
+    n_tasks = 10#len(task_names)
 
 # %% [markdown]
 # ### Function that can spawn processes and schedule them on GPUs to take up each GPUs quota
 
 # %% [code] {"execution":{"iopub.status.busy":"2025-03-30T04:05:23.340363Z","iopub.execute_input":"2025-03-30T04:05:23.340573Z","iopub.status.idle":"2025-03-30T04:05:23.349348Z","shell.execute_reply.started":"2025-03-30T04:05:23.340555Z","shell.execute_reply":"2025-03-30T04:05:23.348749Z"}}
-def parallelize_runs(gpu_quotas, task_usages, n_iterations, verbose=False):
+def parallelize_runs(gpu_quotas, task_usages, n_iterations, verbose=False, calibrate=False):
     gpu_quotas = gpu_quotas[:]
     # Schedule the tasks greedily to max out memory usage
     t = time.time()
@@ -120,7 +120,7 @@ def parallelize_runs(gpu_quotas, task_usages, n_iterations, verbose=False):
                     enough_cpus = sum(map(int, tasks_started)) - sum(map(int, tasks_finished)) < n_cpus
                     if not tasks_started[i] and enough_quota and enough_cpus:
                         gpu_quotas[gpu_id] -= task_usages[i]
-                        args = (task_names[i], split, end_time, n_iterations, gpu_id, memory_dict, solutions_dict, error_queue, i)
+                        args = (task_names[i], split, end_time, n_iterations, gpu_id, memory_dict, solutions_dict, error_queue, i, calibrate)
                         p = multiprocessing.Process(target=solve_task.solve_task, args=args)
                         p.start()
                         processes[i] = p
@@ -150,7 +150,7 @@ if __name__ == '__main__':
 
     gpu_task_quotas = [int(gpu_memory_quota // (1.8 * 1024**3)) for gpu_memory_quota in gpu_memory_quotas] #4
     task_usages = [1 for i in range(n_tasks)]
-    memory_dict, _, _ = parallelize_runs(gpu_task_quotas, task_usages, 2, verbose=False)
+    memory_dict, _, _ = parallelize_runs(gpu_task_quotas, task_usages, 2, verbose=False, calibrate=True)
     
     # Sort the tasks by decreasing memory usage
     tasks = sorted(memory_dict.items(), key=lambda x: x[1], reverse=True)
@@ -163,7 +163,7 @@ if __name__ == '__main__':
 if __name__ == '__main__':
     test_steps = 20
     safe_gpu_memory_quotas = [memory_quota - 1 * 1024**3 for memory_quota in gpu_memory_quotas] #6
-    _, _, time_taken = parallelize_runs(safe_gpu_memory_quotas, task_memory_usages, test_steps, verbose=False)
+    _, _, time_taken = parallelize_runs(safe_gpu_memory_quotas, task_memory_usages, test_steps, verbose=False, calibrate=True)
 
 # %% [markdown]
 # ### Computing the solution for every task, while saturating memory and time
@@ -173,7 +173,7 @@ if __name__ == '__main__':
     time_per_step = time_taken / test_steps
     time_left = end_time - time.time()
     n_steps = int(time_left // time_per_step)
-    _, solutions_dict, time_taken = parallelize_runs(safe_gpu_memory_quotas, task_memory_usages, n_steps, verbose=True)
+    _, solutions_dict, time_taken = parallelize_runs(safe_gpu_memory_quotas, task_memory_usages, n_steps, verbose=True, calibrate=False)
     
     # Format the solutions and put into submission file
     with open('submission.json', 'w') as f:

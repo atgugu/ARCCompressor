@@ -27,7 +27,8 @@ def solve_task(task_name,
                memory_dict,
                solutions_dict,
                error_queue,
-               position):
+               position,
+               calibrate=False):
     try:
         # --- GPU setup & clear old state ---
         torch.cuda.empty_cache()
@@ -40,15 +41,22 @@ def solve_task(task_name,
         path = f'/home/atgu/Desktop/ARCCompressor/2025data/arc-agi_{split}_challenges.json'
         with open(path, 'r') as f:
             problems = json.load(f)
-        task = preprocessing.Task(task_name, problems[task_name], None)
-        del problems
+        # task = preprocessing.Task(task_name, problems[task_name], None)
+        transforms = [
+            preprocessing.Task.rotate_grid,
+            lambda g: preprocessing.Task.rotate_grid(g, 2),
+            lambda g: preprocessing.Task.rotate_grid(g, 3),
+            preprocessing.Task.flip_diagonal,
+            preprocessing.Task.flip_antidiagonal,
+            lambda g: g,
+        ]
+        task = preprocessing.Task(task_name, problems[task_name], None, transforms=transforms)
+
 
         # --- Build model / optimizer / scaler / scheduler / logger ---
         model     = arc_compressor.ARCCompressor(task)
-        # if(task_name == '007bbfb7'):
-        #     model.load_invariant(f'/home/atgu/Desktop/ARCCompressor/invariants/00576224.pt')    
-        # if(task_name == '00576224'):
-        #     model.load_invariant(f'/home/atgu/Desktop/ARCCompressor/invariants/007bbfb7.pt')   
+        model.load_invariant(f'/home/atgu/Desktop/ARCCompressor/invariants/{task_name}.pt')    
+
         optimizer = AdamW8bit(
             model.weights_list,
             lr=1e-2,

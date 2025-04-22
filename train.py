@@ -159,8 +159,8 @@ def take_step(task, task_name, model, optimizer, train_step, train_history_logge
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
     norm_factor = max(2.0, 100.0 / ((train_step+1)*0.2))
-    initial_sigma = 1e-3
-    final_sigma   = 1e-5
+    initial_sigma = 1e-5
+    final_sigma   = 1e-7
     sigma = max(final_sigma, initial_sigma / ((train_step+1)*0.01))
 
     for p in model.weights_list:
@@ -169,8 +169,13 @@ def take_step(task, task_name, model, optimizer, train_step, train_history_logge
             p.grad.add_(torch.randn_like(p.grad) * sigma)
 
     torch.nn.utils.clip_grad_norm_(model.weights_list, max_norm=norm_factor)
-    scaler.step(optimizer)
-    scaler.update()
+    try:
+        scaler.step(optimizer)
+
+        scaler.update()
+    except AssertionError:
+        print("AssertionError: inf or nan values in gradients")
+        pass
     old_lr = optimizer.param_groups[0]['lr']
 
     # 2) step the scheduler on your scalar loss
