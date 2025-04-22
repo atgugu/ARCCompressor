@@ -52,14 +52,14 @@ def solve_task(task_name,
         optimizer = AdamW8bit(
             model.weights_list,
             lr=1e-2,
-            betas=(0.8, 0.95),
-            weight_decay=1e-3
+            betas=(0.5, 0.9),
+            weight_decay=1e-4
         )
         scaler    = torch.amp.GradScaler('cuda')
         scheduler = ReduceLROnPlateau(
             optimizer,
             mode='min',
-            factor=0.9,
+            factor=0.99,
             patience=30,
             threshold=1e-3,
             min_lr=1e-4

@@ -61,7 +61,7 @@ def plot_problem(logger):
             pixels[example_num,n_x+1-grid.shape[0]:n_x+1+grid.shape[0],mode_num,n_y+4-grid.shape[1]:n_y+4+grid.shape[1],:] = repeat_grid
     pixels = pixels.reshape([(n_train+n_test)*(2*n_x+2), 2*(2*n_y+8), 3])
     
-    os.makedirs("plots/", exist_ok=True)
+    os.makedirs("/home/atgu/Desktop/ARCCompressor/plots/", exist_ok=True)
 
     # Plot the combined grid and make gray dividers between the grid cells, arrows, and a question mark for unsolved examples.
     fig, ax = plt.subplots()
@@ -90,7 +90,7 @@ def plot_problem(logger):
                         color=(59/255, 59/255, 59/255),
                         linewidth=0.3)
     plt.axis('off')
-    plt.savefig('plots/' + logger.task.task_name + '_problem.png', bbox_inches='tight', pad_inches=0)
+    plt.savefig('/home/atgu/Desktop/ARCCompressor/plots/' + logger.task.task_name + '_problem.png', bbox_inches='tight', pad_inches=0)
     plt.close()
 
 def plot_solution(logger, fname=None):
@@ -182,7 +182,7 @@ def plot_solution(logger, fname=None):
         ax.text((2*n_y+8)*solution_num+4+n_y-0.5, -3, solution_label, size='xx-small', ha='center', va='center')
     plt.axis('off')
     if fname is None:
-        fname = 'plots/' + logger.task.task_name + '_solutions.pdf'
+        fname = '/home/atgu/Desktop/ARCCompressor/plots/' + logger.task.task_name + '_solutions.pdf'
     plt.savefig(fname, bbox_inches='tight', pad_inches=0)
     plt.close()
 

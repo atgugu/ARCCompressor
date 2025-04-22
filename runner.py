@@ -73,7 +73,7 @@ if __name__ == '__main__':
     kill_python3_processes()
 
     start_time = time.time()
-    end_time = start_time + 1*3600 - 200
+    end_time = int(start_time + 0.5*3600 - 200)
 
     n_cpus = multiprocessing.cpu_count()
     n_gpus = torch.cuda.device_count()
@@ -182,3 +182,170 @@ if __name__ == '__main__':
     print(n_tasks, 'tasks solved.')
     print(n_steps, 'steps taken.')
     print(time_taken, 'seconds taken.')
+
+
+    # %% [code]
+    # Evaluate against the training‑split ground truth
+
+    # Load your predictions
+    with open('submission.json', 'r') as f:
+        preds = json.load(f)
+
+    # Load the true solutions for the training split
+    # (adjust the path to wherever your arc‑agi_training_solutions.json lives)
+    with open('/home/atgu/Desktop/ARCCompressor/2025data/arc-agi_training_solutions.json', 'r') as f:
+        truths = json.load(f)
+
+    perfect = 0
+    total   = len(preds)
+
+    for task_name, pred_examples in preds.items():
+        attempt_1_match = True
+        attempt_2_match = True
+        true_examples = truths.get(task_name)
+        if true_examples is None:
+            # no ground truth for this task
+            continue
+
+        # require that for every example, attempt_1 OR attempt_2 equals the truth
+        all_match = True
+        for i, true_grid in enumerate(true_examples):
+            a1 = pred_examples[i]['attempt_1']
+            a2 = pred_examples[i]['attempt_2']
+            if a1 != true_grid:
+                attempt_1_match = False
+            if a2 != true_grid:
+                attempt_2_match = False
+            if a1 != true_grid and a2 != true_grid:
+                all_match = False
+                break
+
+        if all_match or attempt_1_match or attempt_2_match:
+            perfect += 1
+
+    print(f"Predicted {perfect}/{total} tasks.")
+
+    # %% [code]
+    import matplotlib.pyplot as plt
+
+    color_list = np.array([
+        [0, 0, 0],  # black
+        [30, 147, 255],  # blue
+        [249, 60, 49],  # red
+        [79, 204, 48],  # green
+        [255, 220, 0],  # yellow
+        [153, 153, 153],  # gray
+        [229, 58, 163],  # magenta
+        [255, 133, 27],  # orange
+        [135, 216, 241],  # light blue
+        [146, 18, 49],  # brown
+    ])
+
+    def convert_color(grid):  # grid dims must end in c
+        return np.clip(np.matmul(grid, color_list), 0, 255).astype(np.uint8)
+
+    def plot_problem(logger):
+        n_train = logger.task.n_train
+        n_test  = logger.task.n_test
+        n_x, n_y = logger.task.n_x, logger.task.n_y
+
+        pixels = 255 + np.zeros([n_train+n_test, 2*n_x+2, 2, 2*n_y+8, 3], dtype=np.uint8)
+        for ex in range(n_train+n_test):
+            subsplit = 'train' if ex < n_train else 'test'
+            idx      = ex if ex < n_train else ex - n_train
+            for mode_num, mode in enumerate(('input','output')):
+                if subsplit=='test' and mode=='output': continue
+                grid = np.array(logger.task.unprocessed_problem[subsplit][idx][mode])
+                grid = (np.arange(10)==grid[:,:,None]).astype(np.float32)
+                grid = convert_color(grid)
+                rg = np.repeat(np.repeat(grid,2,0),2,1)
+                pixels[ex, n_x+1-grid.shape[0]:n_x+1+grid.shape[0],
+                        mode_num,
+                        n_y+4-grid.shape[1]:n_y+4+grid.shape[1]] = rg
+
+        img = pixels.reshape([(n_train+n_test)*(2*n_x+2), 2*(2*n_y+8), 3])
+        os.makedirs("plots", exist_ok=True)
+        fig,ax = plt.subplots(figsize=(6,6))
+        ax.imshow(img,interpolation='none',aspect='equal')
+        ax.axis('off')
+        fig.savefig(f"/home/atgu/Desktop/ARCCompressor/plots/{logger.task.task_name}_problem.png", bbox_inches='tight', pad_inches=0)
+        plt.close(fig)
+
+    def plot_solution(logger, fname=None):
+        n_train = logger.task.n_train
+        n_test  = logger.task.n_test
+        n_x, n_y = logger.task.n_x, logger.task.n_y
+
+        sols = [
+        torch.softmax(logger.current_logits,dim=1).cpu().numpy(),
+        torch.softmax(logger.ema_logits,dim=1).cpu().numpy(),
+        logger.solution_most_frequent,
+        logger.solution_second_most_frequent,
+        ]
+        masks = [
+        (logger.current_x_mask, logger.current_y_mask),
+        (logger.ema_x_mask,     logger.ema_y_mask),
+        None, None
+        ]
+        labels = ['sample','sample average','guess 1','guess 2']
+        P = len(sols)
+
+        pixels = 255 + np.zeros([n_test, 2*n_x+2, P, 2*n_y+8, 3], dtype=np.uint8)
+        shapes = []
+
+        for i in range(n_test):
+            shapes.append([])
+            for j,(sol,msk,label) in enumerate(zip(sols,masks,labels)):
+                grid = np.array(sol[i])  # either cxy or xy
+                if 'sample' in label:
+                    grid = np.einsum('dxy,dc->xyc', grid, color_list[logger.task.colors])
+                    xl, yl = (None,None) if not (logger.task.in_out_same_size or logger.task.all_out_same_size) \
+                            else (logger.task.shapes[n_train+i][1])
+                    x0,x1 = logger._best_slice_point(msk[0][i], xl)
+                    y0,y1 = logger._best_slice_point(msk[1][i], yl)
+                    grid = grid[x0:x1,y0:y1,:]
+                    grid = np.clip(grid,0,255).astype(np.uint8)
+                else:
+                    grid = (np.arange(10)==grid[:,:,None]).astype(np.float32)
+                    grid = convert_color(grid)
+
+                shapes[i].append(grid.shape[:2])
+                rg = np.repeat(np.repeat(grid,2,0),2,1)
+                pixels[i, n_x+1-grid.shape[0]:n_x+1+grid.shape[0],
+                        j,
+                        n_y+4-grid.shape[1]:n_y+4+grid.shape[1]] = rg
+
+        img = pixels.reshape([n_test*(2*n_x+2), P*(2*n_y+8), 3])
+        fig,ax = plt.subplots(figsize=(6,6))
+        ax.imshow(img,interpolation='none',aspect='equal')
+        ax.axis('off')
+        if fname is None:
+            fname = f"/home/atgu/Desktop/ARCCompressor/plots/{logger.task.task_name}_solutions.png"
+        fig.savefig(fname, bbox_inches='tight', pad_inches=0)
+        plt.close(fig)
+
+    # %% [code]
+    from preprocessing import Task
+    from solution_selection import Logger
+
+    # load your preds & the challenge definitions for whichever split you're visualizing
+    with open('submission.json') as f: preds = json.load(f)
+    with open('/home/atgu/Desktop/ARCCompressor/2025data/arc-agi_test_challenges.json') as f:
+        problems = json.load(f)
+
+    for name, ex_list in preds.items():
+        task   = Task(name, problems[name], None)
+        logger = Logger(task)
+        # override the two guesses
+        logger.solution_most_frequent = tuple(
+            tuple(tuple(row) for row in ex['attempt_1'])
+            for ex in ex_list
+        )
+        logger.solution_second_most_frequent = tuple(
+            tuple(tuple(row) for row in ex['attempt_2'])
+            for ex in ex_list
+        )
+        # dump plots
+        plot_problem(logger)
+        plot_solution(logger)
+        print("Plotted solution for ", name)

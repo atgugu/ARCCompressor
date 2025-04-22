@@ -25,12 +25,12 @@ class ARCCompressor:
 
     # Define the channel dimensions that all the layers use
     n_layers = 2
-    share_up_dim = 32
-    share_down_dim = 16
-    decoding_dim = 8
+    share_up_dim = 64
+    share_down_dim = 32
+    decoding_dim = 16
     softmax_dim = 8
-    cummax_dim = 8
-    shift_dim = 8
+    cummax_dim = 16
+    shift_dim = 16
     nonlinear_dim = 512 
 
 
@@ -65,7 +65,7 @@ class ARCCompressor:
         self.shift_weights = []
         self.direction_share_weights = []
         self.nonlinear_weights = []
-        self.gaussian_noise = 0.05
+        self.gaussian_noise = 0.01
         # --- new: spatial self‑attention on the [in/out] residual ---
         # dims = [1,1,0,1,1] → channel_dim_fn gives us the embed size
         embed_dim = self.channel_dim_fn([1,1,0,1,1])
@@ -154,7 +154,7 @@ class ARCCompressor:
             initializer.symmetrize_direction_sharing(self.direction_share_weights[layer_num])
 
         self.weights_list = initializer.weights_list
-    @staticmethod
+    # @staticmethod
     def save_invariant(module, filepath):
         """
         Save all invariant submodules of ARCCompressor to a file.
@@ -189,7 +189,7 @@ class ARCCompressor:
         })
         torch.save(state, filepath)
 
-    @staticmethod
+    # @staticmethod
     def load_invariant(module, filepath, device='cuda'):
         """
         Load all invariant submodules of ARCCompressor from a file.
@@ -354,32 +354,46 @@ class ARCCompressor:
         core5d         = core5d + slots_expanded
         x[[1,1,0,1,1]] = core5d
 
-        # -----------------------------------------------------------
-        # ConvGRU + cross‑attention (T = 3 unrolls)
-        core5d = x[[1,1,0,1,1]]              # [B,Cc,H,W,E]
+        core5d = x[[1,1,0,1,1]]      # [B, Cc, H, W, E]
         B, Cc, H, W, E = core5d.shape
-        h      = core5d.mean(dim=1)          # initialise hidden with colour‑avg  [B,H,W,E]
-        h      = h.permute(0,3,1,2).contiguous()   # -> [B,E,H,W]
+        h     = core5d.mean(dim=1)  # [B, H, W, E]
+        h     = h.permute(0,3,1,2)  # [B, E, H, W]
 
-        # slots from previous step (already refined by the GAT)
-        slots  = slots.detach()              # reuse the 'slots' tensor created earlier
-        K = self.ca_k(slots)                 # [B,Cc,E]
-        V = self.ca_v(slots)
+        # prepare slots K,V as before
+        slots = core5d.mean(dim=(2,3)).detach()  # [B, Cc, E]
+        K, V  = self.ca_k(slots), self.ca_v(slots)
 
-        for _ in range(24):                   # unroll 3 steps
-            # --- Cross‑attention message ------------------------------------
-            q   = self.ca_q(h)               # [B,E,H,W]
-            q   = q.flatten(2).transpose(1,2)            # [B,L,E]  L = H·W
-            att = torch.softmax(
-                    torch.matmul(q, K.transpose(-2,-1)) / (E**0.5), dim=-1)  # [B,L,Cc]
-            msg = torch.matmul(att, V)                              # [B,L,E]
-            msg = msg.transpose(1,2).view(B,E,H,W)                  # [B,E,H,W]
+        # UNROLL + COLLECT
+        T = 24
+        h_seq = []
+        for _ in range(T):
+            # cross‐attention message (unchanged)
+            q   = self.ca_q(h).flatten(2).transpose(1,2)      # [B, L=H·W, E]
+            att = torch.softmax(q @ K.transpose(-2,-1) / (E**0.5), dim=-1)  # [B, L, Cc]
+            msg = (att @ V).transpose(1,2).view(B, E, H, W)              # [B, E, H, W]
 
-            # --- ConvGRU update --------------------------------------------
-            h = self.gru(h, msg)
+            # ConvGRU update
+            h = self.gru(h, msg)    # [B, E, H, W]
 
-        # broadcast h back into the multitensor core
-        core5d = core5d + h.permute(0,2,3,1).unsqueeze(1)   # [B,Cc,H,W,E]
+            h_seq.append(h)         # collect for temporal attn
+
+        # STACK into [B, T, E, H, W]
+        h_seq = torch.stack(h_seq, dim=1)
+
+        # SPATIALLY POOL into [B, T, E]
+        #   (you could also use a 1×1 conv + flatten if you wanted something richer)
+        h_summary = h_seq.mean(dim=[3,4])  # mean over H,W
+
+        # TEMPORAL SELF‐ATTENTION
+        #   Input: [B, T, E], returns same shape
+        h_temporal, _ = self.temporal_attn(h_summary, h_summary, h_summary)
+
+        # FUSE the *last* attended vector back into your final hidden map
+        #   take the last time‐step’s refined embedding
+        h_refined = h + h_temporal[:, -1, :].view(B, E, 1, 1).expand(-1, -1, H, W)
+
+        # write it back into the core tensor
+        core5d = core5d + h_refined.permute(0,2,3,1).unsqueeze(1)
         x[[1,1,0,1,1]] = core5d
         # -----------------------------------------------------------
         # Linear Heads

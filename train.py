@@ -121,7 +121,7 @@ def take_step(task, task_name, model, optimizer, train_step, train_history_logge
 
         # 4) L₁ distance
         intial_beta = 100.0       # you can tune this weight
-        final_beta  = 0.01
+        final_beta  = 0.1
         beta = max(final_beta, intial_beta / ((train_step+1)*0.01))
 
         if(not final_beta >= beta):
