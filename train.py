@@ -16,7 +16,7 @@ import visualization
 import random
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torch.nn.functional as F
-
+import gc
 
 """
 This file trains a model for every ARC-AGI task in a split using Adam8bit.
@@ -46,7 +46,7 @@ def take_step(task, task_name, model, optimizer, train_step, train_history_logge
     Runs a forward pass of the model on the ARC-AGI task with mixed precision.
     """
     optimizer.zero_grad()
-    
+
     # Run the forward pass in an AMP context.
     with torch.autocast("cuda"):
         logits, x_mask, y_mask, KL_amounts, KL_names = model.forward()
@@ -153,7 +153,6 @@ def take_step(task, task_name, model, optimizer, train_step, train_history_logge
         loss = loss / 100
 
     # Use GradScaler for mixed precision backward and optimizer step
-
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
     norm_factor = 1

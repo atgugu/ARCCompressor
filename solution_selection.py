@@ -7,104 +7,101 @@ torch.manual_seed(0)
 
 class Logger:
     """
-    Record model outputs, accumulate candidate solutions, and track top-K hypotheses.
+    This class contains functionalities relating to the recording of model outputs, postprocessing,
+    selection of most frequently sampled/highest scoring solutions, accuracy computations, and more.
     """
     ema_decay = 0.97
 
-    def __init__(self, task, top_k=5):
+    def __init__(self, task):
         self.task = task
-        self.top_k = top_k
-        # Curves
         self.KL_curves = {}
         self.total_KL_curve = []
         self.reconstruction_error_curve = []
         self.loss_curve = []
-        self.solution_most_frequent       = tuple([(0, 0), (0, 0)])
-        self.solution_second_most_frequent = tuple([(0, 0), (0, 0)])
 
-        # Buffers for logits and masks
         n_test, n_colors, n_x, n_y = task.n_test, task.n_colors, task.n_x, task.n_y
         shape = (n_test, n_colors + 1, n_x, n_y)
+
         self.current_logits = torch.zeros(shape)
         self.current_x_mask = torch.zeros((n_test, n_x))
         self.current_y_mask = torch.zeros((n_test, n_y))
+
         self.ema_logits = torch.zeros(shape)
         self.ema_x_mask = torch.zeros((n_test, n_x))
         self.ema_y_mask = torch.zeros((n_test, n_y))
 
-        # Tracking solution scores
-        self.solution_hashes_count = {}        # {hash: aggregated_score}
-        self.hash_to_solution = {}             # {hash: grid}
-        self.top_solutions = []                # list of grids for top-K hashes
+        self.solution_hashes_count = {}
+        self.solution_most_frequent = None
+        self.solution_second_most_frequent = None
+
         self.solution_contributions_log = []
-        self.solution_picks_history = []       # list of lists of top-K hashes per step
+        self.solution_picks_history = []
 
-    def log(self, train_step, logits, x_mask, y_mask,
-            KL_amounts, KL_names, total_KL, reconstruction_error, loss):
+    def log(self, train_step, logits, x_mask, y_mask, KL_amounts, KL_names, total_KL, reconstruction_error, loss):
+        """Logs training progress and tracks solutions from one forward pass."""
         if train_step == 0:
-            self.KL_curves = {name: [] for name in KL_names}
-        # record KL, losses
-        for amount,name in zip(KL_amounts, KL_names):
-            self.KL_curves[name].append(float(amount.sum().cpu()))
-        self.total_KL_curve.append(float(total_KL.cpu()))
-        self.reconstruction_error_curve.append(float(reconstruction_error.cpu()))
-        self.loss_curve.append(float(loss.cpu()))
+            self.KL_curves = {KL_name: [] for KL_name in KL_names}
 
-        # update candidate solutions
+        for KL_amount, KL_name in zip(KL_amounts, KL_names):
+            self.KL_curves[KL_name].append(float(KL_amount.detach().sum().cpu().numpy()))
+
+        self.total_KL_curve.append(float(total_KL.detach().cpu().numpy()))
+        self.reconstruction_error_curve.append(float(reconstruction_error.detach().cpu().numpy()))
+        self.loss_curve.append(float(loss.detach().cpu().numpy()))
+
         self._track_solution(train_step, logits.detach(), x_mask.detach(), y_mask.detach())
 
     def _track_solution(self, train_step, logits, x_mask, y_mask):
-        # extract test logits / masks
-        self.current_logits = logits[self.task.n_train:,:,:,:,1]
-        self.current_x_mask = x_mask[self.task.n_train:,:,1]
-        self.current_y_mask = y_mask[self.task.n_train:,:,1]
-        # update EMAs
-        self.ema_logits = self.ema_decay*self.ema_logits + (1-self.ema_decay)*self.current_logits
-        self.ema_x_mask = self.ema_decay*self.ema_x_mask + (1-self.ema_decay)*self.current_x_mask
-        self.ema_y_mask = self.ema_decay*self.ema_y_mask + (1-self.ema_decay)*self.current_y_mask
+        """Postprocess and score solutions and keep track of the top two solutions with highest scores."""
+        self.current_logits = logits[self.task.n_train:, :, :, :, 1]  # example, color, x, y
+        self.current_x_mask = x_mask[self.task.n_train:, :, 1]  # example, x
+        self.current_y_mask = y_mask[self.task.n_train:, :, 1]  # example, y
 
-        # generate two candidate grids: sample & EMA
-        candidates = [
+        self.ema_logits = self.ema_decay * self.ema_logits + (1 - self.ema_decay) * self.current_logits
+        self.ema_x_mask = self.ema_decay * self.ema_x_mask + (1 - self.ema_decay) * self.current_x_mask
+        self.ema_y_mask = self.ema_decay * self.ema_y_mask + (1 - self.ema_decay) * self.current_y_mask
+
+        solution_contributions = []
+        for logits, x_mask_set, y_mask_set in [  # Add two potential solutions: sample and mean.
             (self.current_logits, self.current_x_mask, self.current_y_mask),
             (self.ema_logits, self.ema_x_mask, self.ema_y_mask)
-        ]
-        contributions = []
-        for logits_c, xm, ym in candidates:
-            grid, uncert = self._postprocess_solution(logits_c, xm, ym)
-            h = hash(grid)
-            # map hash→grid once
-            if h not in self.hash_to_solution:
-                self.hash_to_solution[h] = grid
-            # compute score
-            score = -10 * uncert
+        ]:
+
+            # Get the solution and the score.
+            solution, uncertainty = self._postprocess_solution(logits, x_mask_set, y_mask_set)
+            hashed_solution = hash(solution)
+            score = -10*uncertainty
             if train_step < 150:
-                score -= 10
-            if logits_c is self.ema_logits:
-                score -= 4
-            # aggregate via logsumexp
-            prev = self.solution_hashes_count.get(h, -np.inf)
-            self.solution_hashes_count[h] = float(np.logaddexp(prev, score))
-            contributions.append((h, score))
+                score = score - 10
+            if logits is self.ema_logits:
+                score = score - 4
 
-        # record contributions
-        self.solution_contributions_log.append(contributions)
-        # update top-K solutions by aggregated count
-        self._update_top_k()
-        # store history of top-K hashes
-        self.solution_picks_history.append([h for h,_ in self.solution_hashes_count.items()]
-                                           [:self.top_k])
+            # Accumulate scores for solutions.
+            solution_contributions.append((hashed_solution, score))
+            self.solution_hashes_count[hashed_solution] = float(np.logaddexp(
+                self.solution_hashes_count.get(hashed_solution, -np.inf), score))
 
-    def _update_top_k(self):
-        # sort hashes by descending aggregated score
-        sorted_items = sorted(self.solution_hashes_count.items(),
-                              key=lambda kv: kv[1], reverse=True)
-        top = sorted_items[:self.top_k]
-        # update grid list
-        self.top_solutions = [self.hash_to_solution[h] for h,_ in top]
-        if len(self.top_solutions) > 0:
-            self.solution_most_frequent = self.top_solutions[0]
-        if len(self.top_solutions) > 1:
-            self.solution_second_most_frequent = self.top_solutions[1]
+            self._update_most_frequent_solutions(hashed_solution, solution)
+
+        self.solution_contributions_log.append(solution_contributions)
+        self.solution_picks_history.append([hash(sol) for sol in [
+            self.solution_most_frequent, self.solution_second_most_frequent]])
+
+    def _update_most_frequent_solutions(self, hashed, solution):
+        """Keeps track of the top two solutions with highest scores."""
+        if self.solution_most_frequent is None:
+            self.solution_most_frequent = solution
+        if self.solution_second_most_frequent is None:
+            self.solution_second_most_frequent = solution
+
+        if hashed != hash(self.solution_most_frequent):
+            if self.solution_hashes_count[hashed] >= self.solution_hashes_count.get(
+                    hash(self.solution_second_most_frequent), -np.inf):
+                self.solution_second_most_frequent = solution
+                if self.solution_hashes_count[hashed] >= self.solution_hashes_count.get(
+                        hash(self.solution_most_frequent), -np.inf):
+                    self.solution_second_most_frequent = self.solution_most_frequent
+                    self.solution_most_frequent = solution
 
     def best_crop(self, prediction, x_mask, x_length, y_mask, y_length):
         x_start, x_end = self._best_slice_point(x_mask, x_length)

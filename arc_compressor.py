@@ -19,14 +19,14 @@ class ARCCompressor:
     """
     VAE Decoder with on-the-fly color permutation augmentation.
     """
-    n_layers = 2
-    share_up_dim = 64
-    share_down_dim = 32
-    decoding_dim = 16
-    softmax_dim = 8
-    cummax_dim = 16
-    shift_dim = 16
-    nonlinear_dim = 512
+    n_layers = 4
+    share_up_dim = 32
+    share_down_dim = 16
+    decoding_dim = 8
+    softmax_dim = 4
+    cummax_dim = 8
+    shift_dim = 8
+    nonlinear_dim = 256
 
     def channel_dim_fn(self, dims):
         return 16 if dims[2] == 0 else 8
@@ -47,10 +47,10 @@ class ARCCompressor:
 
         # Attention, GRU, SE, and other modules (unchanged)
         embed_dim = self.channel_dim_fn([1,1,0,1,1])
-        self.spatial_attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=8, batch_first=False)
-        self.global_attn  = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=8, batch_first=True)
+        self.spatial_attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=2, batch_first=False)
+        self.global_attn  = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=2, batch_first=True)
         E = embed_dim
-        self.temporal_attn = nn.MultiheadAttention(embed_dim=E, num_heads=8, batch_first=True)
+        self.temporal_attn = nn.MultiheadAttention(embed_dim=E, num_heads=2, batch_first=True)
         self.obj_q   = nn.Linear(E, E, bias=False)
         self.obj_k   = nn.Linear(E, E, bias=False)
         self.obj_v   = nn.Linear(E, E, bias=False)
@@ -181,7 +181,7 @@ class ARCCompressor:
             print("Failed to load weights for task ", filepath)
     def forward(self):
         # On-the-fly color permutation during training
-        if True:
+        if False:
              perm = torch.arange(self.n_colors_plus1, device=self.problem_orig.device)
              perm[1:] = perm[1:][torch.randperm(self.n_colors_plus1-1)]
  
@@ -200,19 +200,19 @@ class ARCCompressor:
         )
         for layer_num in range(self.n_layers):
             x = layers.share_up(x, self.share_up_weights[layer_num]); 
-            x = add_noise_multitensor(x, self.gaussian_noise)
+            # x = add_noise_multitensor(x, self.gaussian_noise)
             x = layers.softmax(x, self.softmax_weights[layer_num], pre_norm=True, post_norm=False, use_bias=False)
-            x = add_noise_multitensor(x, self.gaussian_noise)
+            # x = add_noise_multitensor(x, self.gaussian_noise)
             x = layers.cummax(x, self.cummax_weights[layer_num], self.multitensor_system.task.masks, pre_norm=False, post_norm=True, use_bias=False) 
-            x = add_noise_multitensor(x, self.gaussian_noise)
+            # x = add_noise_multitensor(x, self.gaussian_noise)
             x = layers.shift(x, self.shift_weights[layer_num], self.multitensor_system.task.masks, pre_norm=False, post_norm=True, use_bias=False)
-            x = add_noise_multitensor(x, self.gaussian_noise)
+            # x = add_noise_multitensor(x, self.gaussian_noise)
             x = layers.direction_share(x, self.direction_share_weights[layer_num], pre_norm=True, use_bias=False)
-            x = add_noise_multitensor(x, self.gaussian_noise)
+            # x = add_noise_multitensor(x, self.gaussian_noise)
             x = layers.nonlinear(x, self.nonlinear_weights[layer_num], pre_norm=True, post_norm=False, use_bias=False)
-            x = add_noise_multitensor(x, self.gaussian_noise)
+            # x = add_noise_multitensor(x, self.gaussian_noise)
             x = layers.share_down(x, self.share_down_weights[layer_num])
-            x = add_noise_multitensor(x, self.gaussian_noise)
+            # x = add_noise_multitensor(x, self.gaussian_noise)
             x = layers.normalize(x)
 
             # Squeeze-and-Excitation
@@ -311,3 +311,68 @@ class ARCCompressor:
         y_mask = layers.affine(x[[1,0,0,0,1]], self.mask_weights, use_bias=True)
         x_mask, y_mask = layers.postprocess_mask(self.multitensor_system.task, x_mask, y_mask)
         return output, x_mask, y_mask, KL_amounts, KL_names
+
+        # """
+        # Compute the forward pass of the VAE decoder. Start by using internally stored latents,
+        # and process from there. Output an [example, color, x, y, channel] tensor for the colors,
+        # and an [example, x, channel] and [example, y, channel] tensor for the masks.
+        # Returns:
+        #     Tensor: An [example, color, x, y, channel] tensor, where for every example,
+        #             input/output (picked by channel dimension), and every pixel (picked
+        #             by x and y dimensions), we have a vector full of logits for that
+        #             pixel being each possible color.
+        #     Tensor: An [example, x, channel] tensor, where for every example, input/output
+        #             (picked by channel dimension), and every x, we assign a score that
+        #             contributes to the likelihood that that index of the x dimension is not
+        #             masked out in the prediction.
+        #     Tensor: An [example, y, channel] tensor, used in the same way as above.
+        #     list[Tensor]: A list of tensors indicating the amount of KL contributed by each component
+        #             tensor in the layers.decode_latents() step.
+        #     list[str]: A list of tensor names that correspond to each tensor in the aforementioned output.
+        # """
+        # # Decoding layer
+        # x, KL_amounts, KL_names = layers.decode_latents(
+        #     self.target_capacities, self.decode_weights, self.multiposteriors
+        # )
+
+        # for layer_num in range(self.n_layers):
+        #     # Multitensor communication layer
+        #     x = layers.share_up(x, self.share_up_weights[layer_num])
+
+        #     # Softmax layer
+        #     x = layers.softmax(x, self.softmax_weights[layer_num], pre_norm=True, post_norm=False, use_bias=False)
+
+        #     # Directional layers
+        #     x = layers.cummax(
+        #         x, self.cummax_weights[layer_num], self.multitensor_system.task.masks,
+        #         pre_norm=False, post_norm=True, use_bias=False
+        #     )
+        #     x = layers.shift(
+        #         x, self.shift_weights[layer_num], self.multitensor_system.task.masks,
+        #         pre_norm=False, post_norm=True, use_bias=False
+        #     )
+
+        #     # Directional communication layer
+        #     x = layers.direction_share(x, self.direction_share_weights[layer_num], pre_norm=True, use_bias=False)
+
+        #     # Nonlinear layer
+        #     x = layers.nonlinear(x, self.nonlinear_weights[layer_num], pre_norm=True, post_norm=False, use_bias=False)
+
+        #     # Multitensor communication layer
+        #     x = layers.share_down(x, self.share_down_weights[layer_num])
+
+        #     # Normalization layer
+        #     x = layers.normalize(x)
+
+        # # Linear Heads
+        # output = (
+        #     layers.affine(x[[1, 1, 0, 1, 1]], self.head_weights, use_bias=False)
+        #     + 100 * self.head_weights[1]
+        # )
+        # x_mask = layers.affine(x[[1, 0, 0, 1, 0]], self.mask_weights, use_bias=True)
+        # y_mask = layers.affine(x[[1, 0, 0, 0, 1]], self.mask_weights, use_bias=True)
+
+        # # Postprocessing
+        # x_mask, y_mask = layers.postprocess_mask(self.multitensor_system.task, x_mask, y_mask)
+
+        # return output, x_mask, y_mask, KL_amounts, KL_names

@@ -53,7 +53,7 @@ def solve_task(task_name,
 
         optimizer = AdamW8bit(
             model.weights_list,
-            lr=3e-3,
+            lr=4e-3,
             betas=(0.7, 0.95),
             weight_decay=1e-6
         )
@@ -61,12 +61,11 @@ def solve_task(task_name,
         scheduler = ReduceLROnPlateau(
             optimizer,
             mode='min',
-            factor=0.8,
+            factor=0.95,
             patience=20,
             threshold=1e-3,
             min_lr=1e-4
         )
-        logger    = solution_selection.Logger(task)
 
         # --- Training loop with TQDM & early stop ---
         pbar     = trange(
@@ -85,7 +84,7 @@ def solve_task(task_name,
             # one training step returns the scalar loss
             loss = train.take_step(
                 task, task_name, model, optimizer,
-                step, logger, scaler, scheduler
+                step, train_history_logger, scaler, scheduler
             )
 
             # update tqdm
@@ -93,25 +92,6 @@ def solve_task(task_name,
                 best_loss = loss
                 model.save_invariant(f'/home/atgu/Desktop/ARCCompressor/invariants/{task_name}.pt')
             pbar.set_postfix(loss=f"{loss:.4f}", best=f"{best_loss:.4f}")
-
-            # early‑stop if fully reconstructing train set
-            if step > 30000000:
-                with torch.no_grad():
-                    logits, x_mask, y_mask, _, _ = model.forward()
-                    # add black channel
-                    logits = torch.cat(
-                        [torch.zeros_like(logits[:, :1, :, :]), logits],
-                        dim=1
-                    )
-                    # predicted color index
-                    preds = torch.argmax(logits, dim=1)  # [examples, x, y]
-
-                    # true train outputs
-                    true_train = task.problem[:task.n_train, :, :, 1]
-                    if torch.equal(preds[:task.n_train], true_train):
-                        print("Early stop at step", step, " for task", task_name, "with loss", loss, "and best loss", best_loss, " fully reconstructed train outputs.")
-                        break
-                # scheduler.step(loss)
 
         example_list = []
         for example_num in range(task.n_test):

@@ -45,8 +45,6 @@ class Task:
                         new_ex['output'] = tf(new_ex['output'])
                         augmented.append(new_ex)
         train_all = original_train + augmented
-
-        # train_all += Task.augment_color_examples(train_all)
         
         # Deduplicate examples
         unique, seen = [], set()
