@@ -19,14 +19,14 @@ class ARCCompressor:
     """
     VAE Decoder with on-the-fly color permutation augmentation.
     """
-    n_layers = 4
-    share_up_dim = 32
-    share_down_dim = 16
-    decoding_dim = 8
-    softmax_dim = 4
-    cummax_dim = 8
-    shift_dim = 8
-    nonlinear_dim = 256
+    n_layers = 3
+    share_up_dim = 24
+    share_down_dim = 12
+    decoding_dim = 6
+    softmax_dim = 3
+    cummax_dim = 6
+    shift_dim = 6
+    nonlinear_dim = 192
 
     def channel_dim_fn(self, dims):
         return 16 if dims[2] == 0 else 8
@@ -279,7 +279,7 @@ class ARCCompressor:
         K, V  = self.ca_k(slots), self.ca_v(slots)
 
         # UNROLL + COLLECT
-        T = 6
+        T = 4
         h_seq = []
         for _ in range(T):
             # cross‐attention message (unchanged)
